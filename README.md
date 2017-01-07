@@ -2,7 +2,7 @@
 This tool was developed with the idea of checking whether all numbered Figures and their references are correct in a Microsoft Word document.
 
 Features:
-- Autodetects the Figure keyword (e.g., "Figure" in English, "Figura" in Italian) and warns if more than one keyowrd is used.
+- Detects the Figure keyword (e.g., "Figure" in English, "Figura" in Italian) and warns if more than one keyword is used.
 - Warns you about Figures not referenced in the text.
 - Warns about Figures with the wrong number.
 - If autofix is enabled, tries to correct Figures with the wrong number.
