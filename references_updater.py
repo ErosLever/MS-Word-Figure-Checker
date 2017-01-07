@@ -1,12 +1,109 @@
 import re, zipfile
 from collections import OrderedDict
+from functools import reduce
 
-def xml2txt(xml):
-	return "".join(re.findall(r'<w:t[^>]*>(.*?)</w:t>',xml))
+def xml2txt(xml,br=False):
+	if br:
+		xml = re.sub(r'<w:br/>','\n',xml)
+	return "".join(re.findall(r'<w:t[^\w>]*>(.*?)</w:t>',xml))
 
-sequences = {}
+class EqualityChecker(object):
+	def __eq__(self,other):
+		if isinstance(other, self.__class__):
+			return self.__dict__ == other.__dict__
+		return NotImplemented
 
-class Bookmark(object):
+	def __ne__(self, other):
+		if isinstance(other, self.__class__):
+			return not self.__eq__(other)
+		return NotImplemented
+
+	def __hash__(self):
+		return hash(tuple(sorted(self.__dict__.items())))
+
+class Document(EqualityChecker):
+	def __init__(self,path):
+		with zipfile.ZipFile(path) as zin:
+			for item in zin.infolist():
+				if item.filename == "word/document.xml":
+					self.xml = zin.read(item.filename)
+					self.__find_all_fields()
+					self.__find_all_bookmarks()
+					return
+
+	def __find_all_bookmarks(self):
+		bookmark_ids = re.findall(r'<w:bookmarkStart w:id="(\d+)"', self.xml, re.DOTALL)
+		self.bookmarks = {}
+		for bookmark_id in bookmark_ids:
+			regex = r'<w:bookmarkStart w:id="(%s)" w:name="([^"]+)"[^>]*>(.*?)<w:bookmarkEnd w:id="%s"/>' % (bookmark_id,bookmark_id)
+			bookmark_xml = re.search(regex, self.xml, re.DOTALL)
+			bookmark = Bookmark(*bookmark_xml.groups())
+			self.bookmarks[bookmark.name] = bookmark
+
+	def __find_all_fields(self):
+		fields = re.findall(r'<w:fldChar w:fldCharType="begin"/>.*?(?=<w:fldChar w:fldCharType="(?:end|begin)"/>)',self.xml,re.DOTALL)
+		self.sequences = {}
+		self.references = OrderedDict()
+		for field in fields:
+			field = Field(field)
+			if field.sequence:
+				sequence = self.sequences.get(field.seq_name,[])
+				sequence.append(field)
+				self.sequences[field.seq_name] = sequence
+			elif field.reference:
+				reference = self.references.get(field.ref_name,[])
+				reference.append(field)
+				self.references[field.ref_name] = reference
+
+	def check_fields_and_bookmarks(self):
+		if len(self.sequences) == 1:
+			figure_seq = self.sequences.keys()[0]
+		else:
+			seq_count = sorted([(x,len(y)) for x,y in self.sequences.items()],key=lambda (x,y):-y)
+			seq_count = OrderedDict(seq_count).keys()
+			figure_seq = seq_count[0]
+			print "Most used sequence is '%s', others have been found: %s" % (seq_count[0],", ".join(seq_count[1:]))
+
+		expected_nums = {}
+		for idx,field in enumerate(self.sequences[figure_seq]):
+			expected_nums[field] = str(idx+1)
+
+		field_to_bookmark = {}
+		field_references = {}
+		for bookmark in self.bookmarks.values():
+			if bookmark.field:
+				field_to_bookmark[bookmark.field] = bookmark.name
+				if bookmark.name in self.references:
+					refs = self.references[bookmark.name]
+					field_references[bookmark.field] = refs
+
+		fig_no_bookmark = set(self.sequences[figure_seq]) - set(field_references.keys())
+		if fig_no_bookmark:
+			print "These Figures appear not to be mentioned: %s" % "\n\t".join(map(str,fig_no_bookmark))
+
+		for field in self.sequences[figure_seq]:
+			if not field in field_to_bookmark:
+				print "Can't find corresponding bookmark for reference %s" % (field)
+			if field.text != expected_nums[field]:
+				print "Wrong field declaration, should be %s: %s" % (expected_nums[field],field)
+
+		for name, refs in self.references.items():
+			if not name in field_to_bookmark.values():
+				continue
+			field = self.bookmarks[name].field
+			for ref in refs:
+				if ref.text.replace("%s " % figure_seq,"") != field.text.replace("%s " % figure_seq,""):
+					print "Wrong reference %s should be %s" % (ref,field.text)
+
+		text = re.sub(r'<w:fldChar w:fldCharType="begin"/>.*?<w:fldChar w:fldCharType="end"/>','',self.xml,0,re.DOTALL)
+		text = xml2txt(text,True)
+		for fig_num in expected_nums.values():
+			fig_name = "%s %s" % (figure_seq,fig_num)
+			if fig_name in text:
+				print "Reference to %s found in plain text" % fig_name
+
+
+class Bookmark(EqualityChecker):
 	def __init__(self,id,name,xml):
 		self.id = int(id)
 		self.name = name
@@ -14,96 +111,48 @@ class Bookmark(object):
 		self.nested = bool(re.search(r'<w:bookmarkStart',xml))
 		self.text = xml2txt(xml)
 		
-		field_xml = re.search(r'<w:fldChar w:fldCharType="begin"/>.*?<w:fldChar w:fldCharType="end"/>',xml,re.DOTALL)
+		field_xml = re.search(r'<w:fldChar w:fldCharType="begin"/>.*?(?=<w:fldChar w:fldCharType="(?:end|begin)"/>)',xml,re.DOTALL)
 		if field_xml:
-			instrText = re.search(r'<w:instrText[^>]*>(.*?)</w:instrText>',field_xml.group(0),re.DOTALL)
-			if instrText:
-				seq_name = re.search(r'SEQ (\w+)',instrText.group(1),re.DOTALL)
-				if seq_name:
-					self.seq_name = seq_name.group(1)
-					sequence = sequences.get(self.seq_name,[])
-					sequence.append(self)
-					self.seq_num = len(sequence)
-					sequences[self.seq_name] = sequence
-					self.correct = self.text == "%s %d" % (self.seq_name,self.seq_num)
-		if not hasattr(self,"seq_name"):
-			self.seq_name = None
-		if not hasattr(self,"seq_num"):
-			self.seq_num = 0
-		if not hasattr(self,"correct"):
-			self.correct = True
+			self.field = Field(field_xml.group(0))
+		else:
+			self.field = None
 
 	def __repr__(self):
-		return "<bookmark id=%d name=%s nested=%s seq_name=%s seq_num=%s correct=%s>%s</bookmark>" % (self.id,self.name,self.nested,self.seq_name,self.seq_num,self.correct,self.text)
+		field = str(self.field) if self.field else ""
+		return "<bookmark id=%d name=%s>%s%s</bookmark>" % (self.id,self.name,field,self.text)
 
-def find_all_bookmarks(xml):
-	bookmark_ids = re.findall(r'<w:bookmarkStart w:id="(\d+)"', xml, re.DOTALL)
-	bookmarks = []
-	for bookmark_id in bookmark_ids:
-		regex = r'<w:bookmarkStart w:id="(%s)" w:name="([^"]+)"[^>]*>(.*?)<w:bookmarkEnd w:id="%s"/>' % (bookmark_id,bookmark_id)
-		bookmark_xml = re.search(regex, xml, re.DOTALL)
-		bookmark = Bookmark(*bookmark_xml.groups())
-		bookmarks.append(bookmark)
-	return bookmarks
+class Field(EqualityChecker):
+	def __init__(self,xml):
+		self.text = xml2txt(xml)
+		instrText = re.search(r'<w:instrText[^>]*>(.*?)</w:instrText>',xml,re.DOTALL)
+		if instrText:
+			seq_name = re.search(r'SEQ (\w+)',instrText.group(1),re.DOTALL)
+			if seq_name:
+				self.sequence = True
+				self.reference = False
+				self.seq_name = seq_name.group(1)
+				return
+			self.sequence = False
+			bookmark_name = re.search(r'REF (\w+)',instrText.group(1),re.DOTALL)
+			if bookmark_name:
+				self.reference = True
+				self.ref_name = bookmark_name.group(1)
+			else:
+				self.reference = None
 
-def find_all_sequence_bookmarks(xml):
-	return filter(lambda x:x.seq_name,find_all_bookmarks(xml))
-
-def find_references(xml,)
-
-def fix_xml_references(xml):
-	bookmarks = re.findall('<w:bookmarkStart\W(.*?)<w:bookmarkEnd\W', xml, re.DOTALL)
-	img_bookmarks = filter(lambda x:"> SEQ Figur" in x, bookmarks)
-	counter = 0
-	for bookmark in img_bookmarks:
-		counter += 1
-		bookmark_id = re.search(r' w:name="(_Ref.*?)"',bookmark).group(1)
-		new_value = re.sub(r'<w:t>((?:Figur[ae] )?)\d+</w:t>',r'<w:t>\g<1>%d</w:t>' % counter,bookmark)
-		xml = re.sub(re.escape(bookmark),new_value,xml,0,re.DOTALL)
-		xml = re.sub(r'> REF %s (.*?)<w:t>((?:Figur[ae] )?)\d+</w:t>(\s*)</w:r>' % bookmark_id, r'> REF %s \1<w:t>\g<2>%d</w:t>\3</w:r>' % (bookmark_id, counter), xml, 0, re.DOTALL)
-	return xml
-
-def fix_docx_references(path):
-	with zipfile.ZipFile(path) as zin:
-		with zipfile.ZipFile(path+".refs.docx","w") as zout:
-			for item in zin.infolist():
-				content = zin.read(item.filename)
-				if item == "word/document.xml":
-					content = fix_xml_references(content)
-				zout.writestr(item, content)
+	def __repr__(self):
+		if self.sequence:
+			name = self.seq_name
+		elif self.reference:
+			name = self.ref_name
+		else:
+			name = None
+		return "<field sequence=%s reference=%s name=%s>%s</field>" % (self.sequence,self.reference,name,self.text)
 
 if __name__ == "__main__":
 	import sys
-	map(fix_docx_references,sys.argv[1:])
-
-
-'''
-      <w:bookmarkStart w:id="141" w:name="_Ref470181140"/>
-      <w:proofErr w:type="spellStart"/>
-      <w:r w:rsidRPr="007D4707">
-        <w:t>Figura</w:t>
-      </w:r>
-      <w:proofErr w:type="spellEnd"/>
-      <w:r w:rsidRPr="007D4707">
-        <w:t xml:space="preserve"> </w:t>
-      </w:r>
-      <w:r w:rsidRPr="007D4707">
-        <w:fldChar w:fldCharType="begin"/>
-      </w:r>
-      <w:r w:rsidRPr="007D4707">
-        <w:instrText xml:space="preserve"> SEQ Figura \* ARABIC </w:instrText>
-      </w:r>
-      <w:r w:rsidRPr="007D4707">
-        <w:fldChar w:fldCharType="separate"/>
-      </w:r>
-      <w:r w:rsidR="000760DB">
-        <w:rPr>
-          <w:noProof/>
-        </w:rPr>
-        <w:t>1</w:t>
-      </w:r>
-      <w:r w:rsidRPr="007D4707">
-        <w:fldChar w:fldCharType="end"/>
-      </w:r>
-      <w:bookmarkEnd w:id="141"/>
-'''
+	for docx in sys.argv[1:]:
+		print "Checking file: %s" % docx
+		d = Document(docx)
+		d.check_fields_and_bookmarks()
+		print
