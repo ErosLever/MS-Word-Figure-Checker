@@ -1,11 +1,13 @@
 import re, zipfile
 from collections import OrderedDict
 from functools import reduce
+import difflib
 
 def xml2txt(xml,br=False):
 	if br:
-		xml = re.sub(r'<w:br/>','\n',xml)
-	return "".join(re.findall(r'<w:t[^\w>]*>(.*?)</w:t>',xml))
+		xml = re.sub(r'<w:br/>','<w:t>\n</w:t>',xml)
+		xml = re.sub(r'</w:p>','<w:t>\n</w:t></w:p>',xml)
+	return "".join(re.findall(r'<w:t(?:\s[^>]*)?>(.*?)</w:t(?:\s[^>]*)?>',xml,re.DOTALL))
 
 class EqualityChecker(object):
 	def __eq__(self,other):
@@ -23,6 +25,7 @@ class EqualityChecker(object):
 
 class Document(EqualityChecker):
 	def __init__(self,path):
+		self.path = path
 		with zipfile.ZipFile(path) as zin:
 			for item in zin.infolist():
 				if item.filename == "word/document.xml":
@@ -55,7 +58,7 @@ class Document(EqualityChecker):
 				reference.append(field)
 				self.references[field.ref_name] = reference
 
-	def check_fields_and_bookmarks(self):
+	def check_fields_and_bookmarks(self,autofix=False):
 		if len(self.sequences) == 1:
 			figure_seq = self.sequences.keys()[0]
 		else:
@@ -77,15 +80,25 @@ class Document(EqualityChecker):
 					refs = self.references[bookmark.name]
 					field_references[bookmark.field] = refs
 
-		fig_no_bookmark = set(self.sequences[figure_seq]) - set(field_references.keys())
+		fig_no_bookmark = sorted(set(self.sequences[figure_seq]) - set(field_references.keys()))
 		if fig_no_bookmark:
 			print "These Figures appear not to be mentioned: %s" % "\n\t".join(map(str,fig_no_bookmark))
 
+		if autofix:
+			fixed_xml = self.xml
+			diff = lambda x,y:filter(lambda z:z[:2]in("+ ","- "),difflib.Differ().compare(x.split(">"),y.split(">")))
 		for field in self.sequences[figure_seq]:
-			if not field in field_to_bookmark:
+			if not field in field_to_bookmark and not field in fig_no_bookmark:
 				print "Can't find corresponding bookmark for reference %s" % (field)
 			if field.text != expected_nums[field]:
 				print "Wrong field declaration, should be %s: %s" % (expected_nums[field],field)
+				if autofix:
+					print "Attempting to fix"
+					fixed = re.sub(r'<w:t>((%s\s+)?)\d+</w:t>' % figure_seq,r'<w:t>\g<1>%s</w:t>' % expected_nums[field],field.xml)
+					print "Changes: %s" % diff(field.xml, fixed)
+					fixed_xml = fixed_xml.replace(field.xml,fixed)
+					field.xml = fixed
+					field.text = xml2txt(fixed)
 
 		for name, refs in self.references.items():
 			if not name in field_to_bookmark.values():
@@ -94,14 +107,30 @@ class Document(EqualityChecker):
 			for ref in refs:
 				if ref.text.replace("%s " % figure_seq,"") != field.text.replace("%s " % figure_seq,""):
 					print "Wrong reference %s should be %s" % (ref,field.text)
+					if autofix:
+						print "Attempting to fix"
+						fixed = re.sub(r'<w:t>((%s\s+)?)\d+</w:t>' % figure_seq,r'<w:t>\g<1>%s</w:t>' % expected_nums[field],ref.xml)
+						print "Changes: %s" % diff(ref.xml, fixed)
+						fixed_xml = fixed_xml.replace(ref.xml,fixed)
+						field.xml = fixed
+						field.text = xml2txt(fixed)
 
 		text = re.sub(r'<w:fldChar w:fldCharType="begin"/>.*?<w:fldChar w:fldCharType="end"/>','',self.xml,0,re.DOTALL)
 		text = xml2txt(text,True)
-		for fig_num in expected_nums.values():
+		for fig_num in sorted(expected_nums.values()):
 			fig_name = "%s %s" % (figure_seq,fig_num)
-			if fig_name in text:
+			if re.search(r'%s\D' % fig_name,text):
 				print "Reference to %s found in plain text" % fig_name
 
+		if autofix and fixed_xml != self.xml:
+			with zipfile.ZipFile(self.path) as zin:
+				with zipfile.ZipFile(self.path+".fixed.docx","w") as zout:
+					for item in zin.infolist():
+						if item.filename == "word/document.xml":
+							content = fixed_xml
+						else:
+							content = zin.read(item.filename)
+						zout.writestr(item, content)
 
 class Bookmark(EqualityChecker):
 	def __init__(self,id,name,xml):
@@ -123,6 +152,7 @@ class Bookmark(EqualityChecker):
 
 class Field(EqualityChecker):
 	def __init__(self,xml):
+		self.xml = xml
 		self.text = xml2txt(xml)
 		instrText = re.search(r'<w:instrText[^>]*>(.*?)</w:instrText>',xml,re.DOTALL)
 		if instrText:
@@ -154,5 +184,5 @@ if __name__ == "__main__":
 	for docx in sys.argv[1:]:
 		print "Checking file: %s" % docx
 		d = Document(docx)
-		d.check_fields_and_bookmarks()
+		d.check_fields_and_bookmarks(True)
 		print
